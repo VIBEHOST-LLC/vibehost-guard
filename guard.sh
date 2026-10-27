@@ -2,7 +2,7 @@
 # Torrent guard. Usage: guard.sh <code> | apply | tick
 set -u
 
-VERSION=1
+VERSION=2
 API="${VH_GUARD_API:-https://api.vibehost.net/api/v1/guard}"
 LIB=/usr/local/lib/vibehost-guard
 CONF_DIR=/etc/vibehost-guard
@@ -51,10 +51,20 @@ apply_table() {
     hook_table "$t"
 }
 
+jumps() {
+    $1 -w -S "$2" 2>/dev/null | grep -c -- "-j $CHAIN\$"
+}
+
+# exactly one jump per hook
 hook_table() {
     t=$1
     for h in $(hooks "$t"); do
-        $t -w -C "$h" -j $CHAIN >/dev/null 2>&1 || $t -w -I "$h" 1 -j $CHAIN || return 1
+        n=$(jumps "$t" "$h")
+        while [ "$n" -gt 1 ]; do
+            $t -w -D "$h" -j $CHAIN || return 1
+            n=$((n - 1))
+        done
+        [ "$n" -eq 1 ] || $t -w -I "$h" 1 -j $CHAIN || return 1
     done
 }
 
@@ -64,8 +74,18 @@ intact_table() {
     have=$($t -w -S $CHAIN 2>/dev/null | grep -c -- '--comment "\{0,1\}vh:')
     [ "$have" -eq $((want + 1)) ] || return 1
     for h in $(hooks "$t"); do
-        $t -w -C "$h" -j $CHAIN >/dev/null 2>&1 || return 1
+        [ "$(jumps "$t" "$h")" -eq 1 ] || return 1
     done
+}
+
+# one run at a time
+lock() {
+    [ -z "${VH_GUARD_LOCKED:-}" ] || return 0
+    command -v flock >/dev/null 2>&1 || return 0
+    d=/run
+    [ -d "$d" ] && [ -w "$d" ] || d=/tmp
+    exec 9>"$d/vibehost-guard.lock"
+    flock -w 120 9 || true
 }
 
 apply() {
@@ -241,7 +261,7 @@ tick() {
     latest=$(echo "$answer" | json_field version)
     if [ -n "$latest" ] && [ "$latest" -gt "$VERSION" ] 2>/dev/null; then
         if fetch "$API/guard.sh" "$LIB/guard.sh.new" && sh -n "$LIB/guard.sh.new"; then
-            chmod 755 "$LIB/guard.sh.new" && mv "$LIB/guard.sh.new" "$LIB/guard.sh" && "$LIB/guard.sh" apply
+            chmod 755 "$LIB/guard.sh.new" && mv "$LIB/guard.sh.new" "$LIB/guard.sh" && VH_GUARD_LOCKED=1 "$LIB/guard.sh" apply
         else
             rm -f "$LIB/guard.sh.new"
         fi
@@ -249,7 +269,7 @@ tick() {
 }
 
 case "${1:-}" in
-    apply) apply ;;
-    tick) tick ;;
-    *) install_guard "${1:-}" ;;
+    apply) lock; apply ;;
+    tick) lock; tick ;;
+    *) lock; install_guard "${1:-}" ;;
 esac
