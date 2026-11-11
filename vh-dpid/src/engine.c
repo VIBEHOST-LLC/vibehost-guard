@@ -499,7 +499,17 @@ void vh_engine_packet(vh_engine *e, const uint8_t *packet, size_t len, char hook
 
     ndpi_protocol p = ndpi_detection_process_packet(e->ndpi, f->analysis, l3, (unsigned short) l3_len, now_ms, NULL);
     if (counts_as_bittorrent(&p.protocol_stack, f->analysis->confidence)) {
-        if (peer_known(e, f, ours_is_src, now_ms) || source_marked(e, f, ours_is_src, now_ms)) {
+        /*
+         * The server's own address is the source of every local proxy user at once, so its mark
+         * confirms a weak hit only between client ports: obfuscated traffic to or from a service
+         * (Telegram's MTProto on 443, a proxy listening on 443) is random bytes the library
+         * sometimes calls BitTorrent, and it is somebody else's.
+         */
+        uint16_t our_port = ours_is_src ? t->sport : t->dport;
+        int source_confirms = source_marked(e, f, ours_is_src, now_ms)
+            && (f->hook == VH_HOOK_FORWARD
+                || (peer_port >= FIRST_CLIENT_PORT && our_port >= FIRST_CLIENT_PORT));
+        if (peer_known(e, f, ours_is_src, now_ms) || source_confirms) {
             block(e, f, VH_WEAK_CONFIRMED);
         } else {
             e->stats.weak_alone++;

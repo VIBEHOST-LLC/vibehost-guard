@@ -11,7 +11,7 @@ It stores no payload and sends none anywhere. What leaves the server is counts a
 | Tier | What | Action |
 |---|---|---|
 | Strong | The protocol's own bytes in their place: handshake, DHT, tracker request, UDP tracker, LSD, handshake in uTP | Blocks; the peer is remembered for 30 min, the source for 15 |
-| Weak | The library says BitTorrent, nothing confirms it | Blocks only if this source or peer had a strong hit; otherwise only counted |
+| Weak | The library says BitTorrent, nothing confirms it | Blocks only if this source or peer had a strong hit; otherwise only counted. The server's own address confirms it only between client ports (1024 and up on both ends) |
 | Ignored | Guessed from a port or an address | Never blocks |
 
 TLS, QUIC and DNS are never judged.
