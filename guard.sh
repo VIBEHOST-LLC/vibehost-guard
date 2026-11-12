@@ -2,7 +2,7 @@
 # Torrent guard. Usage: guard.sh <code> | apply | tick | scan
 set -u
 
-VERSION=6
+VERSION=7
 API="${VH_GUARD_API:-https://api.vibehost.net/api/v1/guard}"
 LIB=/usr/local/lib/vibehost-guard
 CONF_DIR=/etc/vibehost-guard
@@ -20,8 +20,8 @@ SCAN_VITAL=' 53 80 123 443 853 '
 DPI_BIT=0x100000
 DPI_PACKETS=12
 DPI_BYTES=512
-DPI_SHA_AMD64=9c8eac1a1b291097f56adc4c8eca97c7b40566616436ae80c2f72176b9566877
-DPI_SHA_ARM64=794d2fa85593d6390c508d29fe55ea6672979dc2b6d84beabea28fbde0164bcc
+DPI_SHA_AMD64=a9d17f60e7b4001e54131570b53319739e94bf9556fd2ca750a0e0b53a496331
+DPI_SHA_ARM64=3c44a36e349fb323033efd8b1f25e6433ca4ec7d21a4320dc34c0b5bc57a4104
 
 SIGNATURES='bt-handshake|BitTorrent protocol
 dht-query|d1:ad2:id20:

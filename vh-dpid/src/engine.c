@@ -408,9 +408,14 @@ static void remember_strong(vh_engine *e, const flow *f, int ours_is_src, uint64
         memory_key(key, t->family, peer, peer_port);
         memory_put(&e->peers, key, now_ms + PEER_TTL_MS);
     }
-    /* The source: forwarded it is one VPN user; local it only corroborates, see below. */
-    memory_key(key, t->family, ours, f->hook == VH_HOOK_FORWARD ? 0 : 1);
-    memory_put(&e->sources, key, now_ms + SOURCE_TTL_MS);
+    /*
+     * The source, forwarded only: there it is one VPN user. Local traffic leaves from the server's own
+     * address for every proxy user at once, so marking it would convict them all for one of them.
+     */
+    if (f->hook == VH_HOOK_FORWARD) {
+        memory_key(key, t->family, ours, 0);
+        memory_put(&e->sources, key, now_ms + SOURCE_TTL_MS);
+    }
 
     /* The server itself is never tainted whole, only the UDP socket that said it is a client. */
     if (f->hook != VH_HOOK_FORWARD && t->proto == IPPROTO_UDP && our_port >= FIRST_CLIENT_PORT) {
@@ -429,7 +434,8 @@ static int peer_known(const vh_engine *e, const flow *f, int ours_is_src, uint64
 static int source_marked(const vh_engine *e, const flow *f, int ours_is_src, uint64_t now_ms) {
     const vh_tuple *t = &f->tuple;
     uint8_t key[18];
-    memory_key(key, t->family, ours_is_src ? t->src : t->dst, f->hook == VH_HOOK_FORWARD ? 0 : 1);
+    if (f->hook != VH_HOOK_FORWARD) return 0;
+    memory_key(key, t->family, ours_is_src ? t->src : t->dst, 0);
     return memory_has(&e->sources, key, now_ms);
 }
 
@@ -500,16 +506,11 @@ void vh_engine_packet(vh_engine *e, const uint8_t *packet, size_t len, char hook
     ndpi_protocol p = ndpi_detection_process_packet(e->ndpi, f->analysis, l3, (unsigned short) l3_len, now_ms, NULL);
     if (counts_as_bittorrent(&p.protocol_stack, f->analysis->confidence)) {
         /*
-         * The server's own address is the source of every local proxy user at once, so its mark
-         * confirms a weak hit only between client ports: obfuscated traffic to or from a service
-         * (Telegram's MTProto on 443, a proxy listening on 443) is random bytes the library
-         * sometimes calls BitTorrent, and it is somebody else's.
+         * Obfuscated protocols (Telegram's MTProto, WhatsApp on 5222, proxies) are random bytes the
+         * library sometimes calls BitTorrent. Locally only the peer confirms it, never the server's
+         * address: that one is shared by every proxy user, see remember_strong.
          */
-        uint16_t our_port = ours_is_src ? t->sport : t->dport;
-        int source_confirms = source_marked(e, f, ours_is_src, now_ms)
-            && (f->hook == VH_HOOK_FORWARD
-                || (peer_port >= FIRST_CLIENT_PORT && our_port >= FIRST_CLIENT_PORT));
-        if (peer_known(e, f, ours_is_src, now_ms) || source_confirms) {
+        if (peer_known(e, f, ours_is_src, now_ms) || source_marked(e, f, ours_is_src, now_ms)) {
             block(e, f, VH_WEAK_CONFIRMED);
         } else {
             e->stats.weak_alone++;

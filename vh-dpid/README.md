@@ -10,8 +10,8 @@ It stores no payload and sends none anywhere. What leaves the server is counts a
 
 | Tier | What | Action |
 |---|---|---|
-| Strong | The protocol's own bytes in their place: handshake, DHT, tracker request, UDP tracker, LSD, handshake in uTP | Blocks; the peer is remembered for 30 min, the source for 15 |
-| Weak | The library says BitTorrent, nothing confirms it | Blocks only if this source or peer had a strong hit; otherwise only counted. The server's own address confirms it only between client ports (1024 and up on both ends) |
+| Strong | The protocol's own bytes in their place: handshake, DHT, tracker request, UDP tracker, LSD, handshake in uTP | Blocks; the peer is remembered for 30 min, a VPN user (forwarded traffic) for 15, a local UDP client port for 15 |
+| Weak | The library says BitTorrent, nothing confirms it | Blocks only if this peer, or this VPN user, had a strong hit; otherwise only counted. The server's own address never confirms it: every local proxy user shares it, and obfuscated traffic (Telegram, WhatsApp) sometimes looks like BitTorrent to the library |
 | Ignored | Guessed from a port or an address | Never blocks |
 
 TLS, QUIC and DNS are never judged.
