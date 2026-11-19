@@ -1,8 +1,8 @@
 #!/bin/sh
-# Torrent guard. Usage: guard.sh <code> | apply | tick | scan
+# Torrent guard. Usage: guard.sh <code> | apply | tick | scan | vpn
 set -u
 
-VERSION=7
+VERSION=9
 API="${VH_GUARD_API:-https://api.vibehost.net/api/v1/guard}"
 LIB=/usr/local/lib/vibehost-guard
 CONF_DIR=/etc/vibehost-guard
@@ -17,11 +17,18 @@ SCAN_LIST="$DPI_RUN/scan"
 SCAN_MODE_FILE="$CONF_DIR/scan.mode"
 SCAN_CHAIN=VH_GUARD_SCAN
 SCAN_VITAL=' 53 80 123 443 853 '
+DPI_FLOWS="$DPI_RUN/flows"
+VPN_DIR=/run/vibehost-guard
+VPN_USERS="$VPN_DIR/vpn.users"
+VPN_SEEN="$VPN_DIR/vpn.seen"
+VPN_OFFSETS="$VPN_DIR/vpn.offsets"
+VPN_CUT_IPS="$VPN_DIR/vpn.cutips"
+VPN_CUT="$CONF_DIR/vpn.cut"
 DPI_BIT=0x100000
 DPI_PACKETS=12
 DPI_BYTES=512
-DPI_SHA_AMD64=a9d17f60e7b4001e54131570b53319739e94bf9556fd2ca750a0e0b53a496331
-DPI_SHA_ARM64=3c44a36e349fb323033efd8b1f25e6433ca4ec7d21a4320dc34c0b5bc57a4104
+DPI_SHA_AMD64=c20901dc83257b7399aff05b2b8440326e6248ec9376ed842d731dace3238364
+DPI_SHA_ARM64=30e9330a5e79a80c2551047f7cad315364f3f32fdffeb185979e79193c1e485e
 
 SIGNATURES='bt-handshake|BitTorrent protocol
 dht-query|d1:ad2:id20:
@@ -175,6 +182,7 @@ scan_mode() {
 scan_fill() {
     t=$1
     $t -w -F $SCAN_CHAIN 2>/dev/null || return 0
+    vpn_cut_fill "$t"
     [ "$(scan_mode)" = block ] && [ -r "$SCAN_LIST" ] || return 0
     now=$(date +%s)
     n=0
@@ -214,7 +222,7 @@ scan_sync() {
 scan_rules() {
     for t in $(tables); do
         $t -w -S $SCAN_CHAIN 2>/dev/null
-    done | grep -c -- '-j DROP'
+    done | grep -c -- 'vhscan-'
 }
 
 scan_write_units() {
@@ -239,9 +247,289 @@ EOF
 }
 
 scan_remove_units() {
-    [ -f /etc/systemd/system/vibehost-guard-scan.path ] || return 0
-    systemctl disable --now vibehost-guard-scan.path >/dev/null 2>&1
-    rm -f /etc/systemd/system/vibehost-guard-scan.path /etc/systemd/system/vibehost-guard-scan.service
+    for u in scan vpn; do
+        [ -f /etc/systemd/system/vibehost-guard-$u.path ] || continue
+        systemctl disable --now vibehost-guard-$u.path >/dev/null 2>&1
+        rm -f /etc/systemd/system/vibehost-guard-$u.path /etc/systemd/system/vibehost-guard-$u.service
+    done
+}
+
+vpn_write_units() {
+    cat > /etc/systemd/system/vibehost-guard-vpn.path <<EOF
+[Unit]
+Description=VibeHost guard: the analyser judged new torrent connections
+
+[Path]
+PathModified=$DPI_FLOWS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    cat > /etc/systemd/system/vibehost-guard-vpn.service <<EOF
+[Unit]
+Description=VibeHost guard: which VPN user made them
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=$LIB/guard.sh vpn
+EOF
+}
+
+VPN_AWK='
+function private(a) {
+    return a ~ /^10\./ || a ~ /^192\.168\./ || a ~ /^172\.(1[6-9]|2[0-9]|3[01])\./ \
+        || a ~ /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./ || a ~ /^f[cd][0-9a-f]*:/
+}
+function hex(s,   h, i) {
+    h = ""
+    for (i = 1; i <= length(s) && i <= 96; i++) h = h sprintf("%02x", ord[substr(s, i, 1)])
+    return h
+}
+function unhex(h,   s, i) {
+    s = ""
+    for (i = 1; i < length(h); i += 2) s = s chr[substr(h, i, 2)]
+    return s
+}
+function hostport(a) {
+    if (a ~ /^\[/) { host = substr(a, 2); sub(/\].*/, "", host); port = a; sub(/.*\]:/, "", port); return }
+    host = a; sub(/:[0-9]+$/, "", host); port = a; sub(/.*:/, "", port)
+}
+function inport(tag) {
+    return tag ~ /^inbound-[0-9]+$/ ? substr(tag, 9) + 0 : 0
+}
+function record(proto, name, tag, src,   k, n, i, ids) {
+    if (name == "") return
+    if (tag != "") tags[name] = tag
+    if (src != "" && (name in cut)) ips[name, src] = 1
+    k = proto " " host " " port
+    if (!(k in key)) return
+    n = split(key[k], ids, " ")
+    for (i = 1; i <= n; i++) {
+        if (ids[i] in owner) continue
+        owner[ids[i]] = name
+        count[name]++
+        kind[name] = mode
+    }
+}
+BEGIN {
+    for (i = 1; i < 256; i++) { c = sprintf("%c", i); ord[c] = i; chr[sprintf("%02x", i)] = c }
+    while ((getline l < flows) > 0) {
+        if (split(l, f, " ") < 6 || f[6] + 0 <= since + 0) continue
+        id++
+        key[f[1] " " f[4] " " f[5]] = key[f[1] " " f[4] " " f[5]] " " id
+        key[f[1] " " f[2] " " f[3]] = key[f[1] " " f[2] " " f[3]] " " id
+        if (private(f[2]) && !private(f[4])) fwd[id] = f[2]
+        else if (private(f[4]) && !private(f[2])) fwd[id] = f[4]
+    }
+    nflows = id
+    while ((getline l < cutfile) > 0) {
+        if (split(l, f, " ") < 3 || f[3] + 0 <= now + 0) continue
+        nm = unhex(f[1]); cut[nm] = f[3]; cutkind[nm] = f[2]
+    }
+    while ((getline l < oldcut) > 0) {
+        if (split(l, f, " ") < 5) continue
+        nm = unhex(f[5])
+        if (nm in cut) line[f[1] " " f[2]] = cut[nm] " " f[4] " " f[5]
+    }
+}
+/^#xray$/ { mode = "xray"; next }
+/^#sing$/ { mode = "sing"; next }
+mode == "xray" {
+    a = index($0, " accepted "); e = index($0, "email: ")
+    if (!a || !e) next
+    name = substr($0, e + 7); sub(/[ \r]+$/, "", name)
+    rest = substr($0, a + 10); dest = rest; sub(/ .*/, "", dest)
+    proto = dest; sub(/:.*/, "", proto); hostport(substr(dest, length(proto) + 2))
+    tag = ""
+    if (index(rest, "[")) { tag = substr(rest, index(rest, "[") + 1); sub(/ (>>|->).*/, "", tag) }
+    src = ""
+    if (index($0, " from ")) {
+        src = substr($0, index($0, " from ") + 6); sub(/ .*/, "", src); sub(/^(tcp|udp):/, "", src)
+        if (src ~ /^\[/) { src = substr(src, 2); sub(/\].*/, "", src) } else sub(/:[0-9]+$/, "", src)
+    }
+    record(proto, name, tag, src)
+    next
+}
+mode == "sing" {
+    if (!match($0, /\]: \[[^]]+\] inbound (packet )?connection (to|from) /)) next
+    seg = substr($0, RSTART + 4, RLENGTH - 4)
+    name = substr(seg, 1, index(seg, "]") - 1)
+    addr = substr($0, RSTART + RLENGTH); sub(/ .*/, "", addr)
+    hostport(addr)
+    if (seg ~ / from $/) { from[name] = host; next }
+    tag = ""
+    if (match($0, /inbound\/[a-z0-9-]+\[[^]]*\]/)) { tag = substr($0, RSTART, RLENGTH); sub(/^[^[]*\[/, "", tag); sub(/\]$/, "", tag) }
+    record(seg ~ /packet/ ? "udp" : "tcp", name, tag, (name in from) ? from[name] : "")
+    next
+}
+END {
+    for (id = 1; id <= nflows; id++) {
+        if ((id in owner) || !(id in fwd)) continue
+        nm = fwd[id]; count[nm]++; kind[nm] = "fwd"
+    }
+    for (nm in count) printf "%s %s %s %d\n", hex(nm), kind[nm], (nm in tags) ? hex(tags[nm]) : "-", count[nm] > found
+    for (nm in cut) {
+        if (cutkind[nm] == "fwd") { line[nm " 0"] = cut[nm] " fwd " hex(nm); continue }
+        for (k in ips) {
+            split(k, q, SUBSEP)
+            if (q[1] == nm) line[q[2] " " inport(tags[nm])] = cut[nm] " " cutkind[nm] " " hex(nm)
+        }
+    }
+    for (k in line) print k, line[k] > cutout
+}'
+
+vpn_logs() {
+    for d in /proc/[0-9]*; do
+        case "$(cat "$d/comm" 2>/dev/null)" in xray*|v2ray*|rw-core*) k=xray ;; sing-box*) k=sing ;; *) continue ;; esac
+        for fd in "$d"/fd/*; do
+            f=$(readlink "$fd" 2>/dev/null) || continue
+            case "$k:$f" in xray:/*access*|sing:/*.log) echo "$k $fd" ;; esac
+        done
+    done
+}
+
+vpn_cores() {
+    for d in /proc/[0-9]*; do
+        case "$(cat "$d/comm" 2>/dev/null)" in xray*|v2ray*|rw-core*|sing-box*) echo x ;; esac
+    done | wc -l
+}
+
+vpn_chunks() {
+    : > "$VPN_DIR/vpn.log"
+    : > "$VPN_OFFSETS.new"
+    vpn_logs | while read -r kind fd; do
+        id=$(stat -L -c '%d:%i' "$fd" 2>/dev/null) || continue
+        grep -q "^$id " "$VPN_OFFSETS.new" && continue
+        size=$(stat -L -c '%s' "$fd" 2>/dev/null) || continue
+        echo "$id $size" >> "$VPN_OFFSETS.new"
+        [ "$1" = read ] || continue
+        prev=$(sed -n "s/^$id //p" "$VPN_OFFSETS" 2>/dev/null)
+        case "$prev" in ''|*[!0-9]*) prev=$((size > 4194304 ? size - 4194304 : 0)) ;; esac
+        [ "$prev" -le "$size" ] || prev=0
+        from=$((prev > 2097152 ? prev - 2097152 : 0))
+        [ $((size - from)) -le 33554432 ] || from=$((size - 33554432))
+        echo "#$kind" >> "$VPN_DIR/vpn.log"
+        tail -c +$((from + 1)) "$fd" 2>/dev/null | head -c $((size - from)) >> "$VPN_DIR/vpn.log"
+        echo >> "$VPN_DIR/vpn.log"
+    done
+    mv -f "$VPN_OFFSETS.new" "$VPN_OFFSETS"
+}
+
+vpn_run() {
+    mkdir -p "$VPN_DIR" && chmod 700 "$VPN_DIR"
+    now=$(date +%s)
+    since=$(cat "$VPN_SEEN" 2>/dev/null)
+    case "$since" in ''|*[!0-9]*) since=0 ;; esac
+    fresh=0
+    [ -r "$DPI_FLOWS" ] && fresh=$(awk -v s="$since" '$6 > s' "$DPI_FLOWS" | wc -l)
+    if [ "$fresh" -gt 0 ] || [ -s "$VPN_CUT" ]; then vpn_chunks read; else vpn_chunks skip; fi
+    : > "$VPN_DIR/vpn.found"
+    : > "$VPN_DIR/vpn.news"
+    LC_ALL=C awk -v flows="$DPI_FLOWS" -v since="$since" -v now="$now" -v cutfile="$VPN_CUT" \
+        -v oldcut="$VPN_CUT_IPS" -v found="$VPN_DIR/vpn.found" -v cutout="$VPN_CUT_IPS.new" \
+        "$VPN_AWK" "$VPN_DIR/vpn.log"
+    rm -f "$VPN_DIR/vpn.log"
+    touch "$VPN_CUT_IPS.new"
+    if ! cmp -s "$VPN_CUT_IPS.new" "$VPN_CUT_IPS"; then
+        mv -f "$VPN_CUT_IPS.new" "$VPN_CUT_IPS"
+        scan_sync
+    else
+        rm -f "$VPN_CUT_IPS.new"
+    fi
+    [ "$fresh" -gt 0 ] || return 0
+    awk '{ if ($6 > m) m = $6 } END { print m + 0 }' "$DPI_FLOWS" > "$VPN_SEEN"
+    LC_ALL=C awk -v now="$now" -v old="$VPN_USERS" -v news="$VPN_DIR/vpn.news" '
+        BEGIN { while ((getline l < old) > 0) { split(l, f, " "); u[f[1]] = l; n[f[1]] = f[4]; first[f[1]] = f[5]; last[f[1]] = f[6] } }
+        {
+            if (!($1 in u) || last[$1] < now - 86400) print $1 > news
+            u[$1] = $1 " " $2 " " $3 " " (n[$1] + $4) " " (($1 in first) ? first[$1] : now) " " now
+        }
+        END { for (h in u) { split(u[h], f, " "); if (f[6] >= now - 604800) print u[h] } }
+    ' "$VPN_DIR/vpn.found" > "$VPN_USERS.new" && mv -f "$VPN_USERS.new" "$VPN_USERS"
+}
+
+vpn_cut_fill() {
+    t=$1
+    [ -r "$VPN_CUT_IPS" ] || return 0
+    now=$(date +%s)
+    n=0
+    while read -r ip port until kind rest; do
+        [ "$n" -lt 256 ] || break
+        case "$until" in ''|*[!0-9]*) continue ;; esac
+        [ "$until" -gt "$now" ] || continue
+        case "$port" in ''|*[!0-9]*) continue ;; esac
+        case "$ip" in
+            *:*) [ "$t" = ip6tables ] || continue
+                 case "$ip" in *[!0-9a-fA-F:]*) continue ;; esac ;;
+            *) [ "$t" = iptables ] || continue
+               case "$ip" in *[!0-9.]*|'') continue ;; esac ;;
+        esac
+        if [ "$kind" = fwd ]; then
+            $t -w -A $SCAN_CHAIN -s "$ip" -m comment --comment vhuser -j DROP 2>/dev/null
+        elif [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+            $t -w -A $SCAN_CHAIN -s "$ip" -p tcp --dport "$port" -m comment --comment vhuser -j DROP 2>/dev/null
+            $t -w -A $SCAN_CHAIN -s "$ip" -p udp --dport "$port" -m comment --comment vhuser -j DROP 2>/dev/null
+        else
+            $t -w -A $SCAN_CHAIN -s "$ip" -p tcp ! --dport 22 -m addrtype --dst-type LOCAL \
+                -m comment --comment vhuser -j DROP 2>/dev/null
+            $t -w -A $SCAN_CHAIN -s "$ip" ! -p tcp -m addrtype --dst-type LOCAL -m comment --comment vhuser -j DROP 2>/dev/null
+        fi
+        n=$((n + 1))
+    done < "$VPN_CUT_IPS"
+}
+
+vpn_panels() {
+    {
+        { [ -d /usr/local/x-ui ] || [ -f /etc/x-ui/x-ui.db ]; } && echo 3x-ui
+        [ -d /usr/local/s-ui ] && echo s-ui
+        [ -d /opt/hiddify-manager ] && echo hiddify
+        { [ -d /opt/marzban ] || [ -d /var/lib/marzban ]; } && echo marzban
+        { [ -d /opt/pasarguard ] || [ -d /var/lib/pasarguard ]; } && echo pasarguard
+        [ -d /var/lib/marzneshin ] && echo marzneshin
+        [ -d /opt/remnanode ] && echo remnawave
+        if command -v docker >/dev/null 2>&1; then
+            { command -v timeout >/dev/null 2>&1 && timeout 5 docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null; } \
+                | tr 'A-Z' 'a-z' | while read -r n i; do
+                case "$n $i" in
+                    *3x-ui*|*x-ui*) echo 3x-ui ;; *marzban*) echo marzban ;; *pasarguard*) echo pasarguard ;;
+                    *marzneshin*) echo marzneshin ;; *remnanode*|*remnawave*) echo remnawave ;; *hiddify*) echo hiddify ;;
+                    *amnezia*) echo amnezia ;; *wg-easy*) echo wg-easy ;; *shadowbox*|*outline*) echo outline ;;
+                    *s-ui*) echo s-ui ;;
+                esac
+            done
+        fi
+        for u in /sys/class/net/*/uevent; do
+            case "$(cat "$u" 2>/dev/null)" in *DEVTYPE=wireguard*) echo wireguard ;; *DEVTYPE=amneziawg*) echo amneziawg ;; esac
+        done
+        for d in /proc/[0-9]*; do
+            case "$(cat "$d/comm" 2>/dev/null)" in openvpn) echo openvpn ;; ocserv*) echo openconnect ;; esac
+        done
+    } | sort -u | head -n 16 | tr '\n' ',' | sed 's/,$//'
+}
+
+vpn_report() {
+    cores=$(vpn_cores)
+    log=
+    if [ "$cores" -gt 0 ]; then
+        if [ -n "$(vpn_logs)" ]; then log=ok; else log=none; fi
+    fi
+    users=
+    if [ -r "$VPN_USERS" ]; then
+        users=$(sort -k6,6nr "$VPN_USERS" | awk -v now="$(date +%s)" \
+            '$6 >= now - 86400 && n < 32 { printf "%s%s:%s:%s:%s:%s:%s", (n++ ? ";" : ""), $1, $2, $3, $4, $5, $6 }')
+    fi
+    printf '"panels":"%s","log":"%s","users":"%s"' "$(vpn_panels)" "$log" "$users"
+}
+
+vpn_cut_save() {
+    echo "$1" | tr ';' '\n' | awk -F: 'NF == 3 && $1 ~ /^[0-9a-f]+$/ && $2 ~ /^[a-z]+$/ && $3 ~ /^[0-9]+$/ { print $1, $2, $3 }' \
+        > "$VPN_CUT.new"
+    if cmp -s "$VPN_CUT.new" "$VPN_CUT" 2>/dev/null; then
+        rm -f "$VPN_CUT.new"
+        return 1
+    fi
+    mv -f "$VPN_CUT.new" "$VPN_CUT"
 }
 
 counters() {
@@ -308,7 +596,7 @@ Description=VibeHost torrent guard analyser
 After=network-pre.target vibehost-guard.service
 
 [Service]
-ExecStart=$DPI_BIN --mode $1 --stats $DPI_STATS --scan $SCAN_LIST
+ExecStart=$DPI_BIN --mode $1 --stats $DPI_STATS --scan $SCAN_LIST --flows $DPI_FLOWS
 Restart=on-failure
 RestartSec=30
 RestartPreventExitStatus=2 3
@@ -347,7 +635,7 @@ dpi_stop() {
         kill "$(cat "$DPI_PID")" 2>/dev/null
         rm -f "$DPI_PID"
     fi
-    rm -f "$DPI_STATS" "$SCAN_LIST"
+    rm -f "$DPI_STATS" "$SCAN_LIST" "$DPI_FLOWS"
 }
 
 dpi_start() {
@@ -358,18 +646,29 @@ dpi_start() {
     if dpi_systemd; then
         dpi_write_unit "$1"
         scan_write_units
+        vpn_write_units
         systemctl daemon-reload
         systemctl enable vibehost-guard-dpid.service >/dev/null 2>&1
         systemctl restart vibehost-guard-dpid.service >/dev/null 2>&1
         systemctl enable --now vibehost-guard-scan.path >/dev/null 2>&1
+        systemctl enable --now vibehost-guard-vpn.path >/dev/null 2>&1
     else
         mkdir -p "$DPI_RUN"
         if [ -r "$DPI_PID" ] && kill "$(cat "$DPI_PID")" 2>/dev/null; then
             n=0
             while kill -0 "$(cat "$DPI_PID")" 2>/dev/null && [ $n -lt 10 ]; do sleep 1; n=$((n + 1)); done
         fi
-        nohup "$DPI_BIN" --mode "$1" --stats "$DPI_STATS" --scan "$SCAN_LIST" >/dev/null 2>&1 9>&- &
+        nohup "$DPI_BIN" --mode "$1" --stats "$DPI_STATS" --scan "$SCAN_LIST" --flows "$DPI_FLOWS" >/dev/null 2>&1 9>&- &
         echo $! > "$DPI_PID"
+    fi
+}
+
+dpi_current() {
+    if dpi_systemd; then
+        grep -q -- '--flows' /etc/systemd/system/vibehost-guard-dpid.service 2>/dev/null \
+            && [ -f /etc/systemd/system/vibehost-guard-vpn.path ]
+    else
+        tr '\0' ' ' < "/proc/$(cat "$DPI_PID" 2>/dev/null)/cmdline" 2>/dev/null | grep -q -- '--flows'
     fi
 }
 
@@ -397,7 +696,7 @@ dpi_sync() {
     fi
     dpi_install_binary || return 1
     running_mode=$(sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p' "$DPI_STATS" 2>/dev/null)
-    if ! dpi_alive || { [ -n "$running_mode" ] && [ "$running_mode" != "$mode" ]; }; then
+    if ! dpi_alive || ! dpi_current || { [ -n "$running_mode" ] && [ "$running_mode" != "$mode" ]; }; then
         dpi_start "$mode"
     fi
 }
@@ -551,7 +850,8 @@ tick() {
     ok=true
     ensure || ok=false
     [ -n "$VIBEHOST_GUARD_TOKEN" ] || return 0
-    body="{\"version\":$VERSION,\"rulesOk\":$ok,\"os\":\"$(os_name)\",\"counters\":{$(counters)},\"dpi\":{$(dpi_report)},\"scan\":{\"mode\":\"$(scan_mode)\",\"rules\":$(scan_rules)}}"
+    vpn_run </dev/null || true
+    body="{\"version\":$VERSION,\"rulesOk\":$ok,\"os\":\"$(os_name)\",\"counters\":{$(counters)},\"dpi\":{$(dpi_report)},\"scan\":{\"mode\":\"$(scan_mode)\",\"rules\":$(scan_rules)},\"vpn\":{$(vpn_report)}}"
     answer=$(post "$API/heartbeat" "$body" "$VIBEHOST_GUARD_TOKEN") || return 0
     wanted=$(echo "$answer" | json_field dpi)
     case "$wanted" in off|shadow|enforce)
@@ -573,6 +873,8 @@ tick() {
         fi
         ;;
     esac
+    mkdir -p "$CONF_DIR"
+    if vpn_cut_save "$(echo "$answer" | json_field vpnCut)"; then vpn_run </dev/null || true; fi
     latest=$(echo "$answer" | json_field version)
     if [ -n "$latest" ] && [ "$latest" -gt "$VERSION" ] 2>/dev/null; then
         if fetch "$API/guard.sh" "$LIB/guard.sh.new" && sh -n "$LIB/guard.sh.new"; then
@@ -587,5 +889,6 @@ case "${1:-}" in
     apply) lock; apply ;;
     tick) lock; tick ;;
     scan) lock; scan_sync ;;
+    vpn) lock; vpn_run; if [ -s "$VPN_DIR/vpn.news" ]; then tick; fi ;;
     *) lock; install_guard "${1:-}" ;;
 esac

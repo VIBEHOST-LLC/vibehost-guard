@@ -31,6 +31,14 @@ user or a container, `port <n> <until>` for a port the server itself scanned (ne
 `<until>` in Unix seconds. `guard.sh` blocks them only when VibeHost sets the scan mode to `block`. The stats
 file carries `scanFailed`, `scanEvents`, `scanActive` and `scanPorts`: counts and port numbers, no address.
 
+## VPN users
+
+With `--flows <file>` it keeps the connections it judged BitTorrent in the last 10 minutes, one per line:
+`<tcp|udp> <src> <sport> <dst> <dport> <unix>`, mode 0600. It reads nothing else. `guard.sh vpn` (root) matches
+them to the access log of Xray or sing-box that the proxy holds open, or to the user's address inside a
+WireGuard/OpenVPN tunnel, and reports the VPN user's name to VibeHost: the server's owner disables that user
+instead of losing the server. When the owner asks, the user's addresses are dropped for 24 hours.
+
 ## Build
 
 ```sh
@@ -47,6 +55,7 @@ docker buildx build --platform linux/arm64 --target out -o out/arm64 .
 # On a real kernel, as root in a privileged container, with iptables, iproute2, python3, conntrack-tools, procps:
 sh tests/live-test.sh ./vh-dpid
 sh tests/guard-test.sh guard.sh vh-dpid.gz
+sh tests/vpn-test.sh ./vh-dpid guard.sh
 ```
 
 ## License

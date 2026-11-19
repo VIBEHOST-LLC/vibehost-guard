@@ -9,4 +9,6 @@ curl -fsSL https://api.vibehost.net/api/v1/guard/guard.sh | sh -s <code>
 
 - `guard.sh apply` - reapply rules (boot)
 - `guard.sh tick` - restore rules and report (every 5 min)
+- `guard.sh scan` - apply the analyser's list of scanners (when it changes)
+- `guard.sh vpn` - name the VPN user behind the analyser's torrent connections (when it judges new ones)
 - `remove-guard.sh` - remove everything (staff only)

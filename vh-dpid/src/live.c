@@ -3,11 +3,14 @@
  * mark on a connection the engine judged BitTorrent; a rule of guard.sh drops what carries the bit.
  * Traffic never waits for this process: if it stops, nothing changes on the network.
  *
- *   vh-dpid --mode shadow|enforce --stats <file> [--scan <file>]
+ *   vh-dpid --mode shadow|enforce --stats <file> [--scan <file>] [--flows <file>]
  *
  * With --scan it also keeps <file> listing the sources it judged to be scanning, for guard.sh to block
  * when VibeHost says so: "src <address> <until>" for a VPN user or a container, "port <n> <until>" for a
  * port the server itself scanned (never a web, DNS or time port), <until> in Unix seconds.
+ *
+ * With --flows it keeps <file> (0600) listing the connections judged BitTorrent in the last 10 minutes,
+ * "<tcp|udp> <src> <sport> <dst> <dport> <unix>", for guard.sh to tell which VPN user made them.
  *
  * Exit codes: 3 - this kernel cannot do it (no nfnetlink_log, no ctnetlink, not allowed).
  *
@@ -15,6 +18,7 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libmnl/libmnl.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
@@ -47,6 +51,20 @@ static unsigned int ct_portid, ct_seq;
 static uint64_t marked, mark_failed;
 static const char *scan_path;
 static uint64_t scan_written = UINT64_MAX;
+static const char *flows_path;
+
+#define FLOWS_KEPT 512
+#define FLOWS_FOR_MS (10u * 60u * 1000u)
+#define FLOWS_EVERY_MS 30000u
+
+static struct {
+    vh_tuple t;
+    uint64_t at_ms;
+    long long wall;
+} flows[FLOWS_KEPT];
+static size_t flows_next;
+static int flows_changed;
+static uint64_t verdict_now;
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -121,10 +139,46 @@ static int mark_flow(const vh_tuple *t) {
     return 0;
 }
 
+static void remember_flow(const vh_tuple *t) {
+    /* A verdict the kernel could not carry out yet is asked again on the next packet. */
+    for (size_t k = 1; k <= 32; k++) {
+        size_t i = (flows_next + FLOWS_KEPT - k) % FLOWS_KEPT;
+        if (flows[i].at_ms && !memcmp(&flows[i].t, t, sizeof *t)) return;
+    }
+    flows[flows_next].t = *t;
+    flows[flows_next].at_ms = verdict_now ? verdict_now : 1;
+    flows[flows_next].wall = (long long) time(NULL);
+    flows_next = (flows_next + 1) % FLOWS_KEPT;
+    flows_changed = 1;
+}
+
 static int on_verdict(const vh_tuple *t, vh_reason reason, void *user) {
     (void) reason;
     (void) user;
+    if (flows_path) remember_flow(t);
     return enforce ? mark_flow(t) : 1;
+}
+
+static void write_flows(uint64_t now) {
+    char tmp[512];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", flows_path) >= (int) sizeof tmp) return;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return;
+    }
+    for (size_t i = 0; i < FLOWS_KEPT; i++) {
+        if (!flows[i].at_ms || now - flows[i].at_ms > FLOWS_FOR_MS) continue;
+        const vh_tuple *t = &flows[i].t;
+        char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
+        if (!inet_ntop(t->family, t->src, src, sizeof src) || !inet_ntop(t->family, t->dst, dst, sizeof dst)) continue;
+        fprintf(f, "%s %s %u %s %u %lld\n", t->proto == IPPROTO_UDP ? "udp" : "tcp", src, t->sport, dst, t->dport,
+                flows[i].wall);
+    }
+    fclose(f);
+    if (rename(tmp, flows_path) == 0) flows_changed = 0;
 }
 
 /* ---- the stats file guard.sh reports: counts and port numbers, never an address ---- */
@@ -284,9 +338,10 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--mode")) enforce = !strcmp(argv[i + 1], "enforce");
         else if (!strcmp(argv[i], "--stats")) stats_path = argv[i + 1];
         else if (!strcmp(argv[i], "--scan")) scan_path = argv[i + 1];
+        else if (!strcmp(argv[i], "--flows")) flows_path = argv[i + 1];
     }
     if (!stats_path) {
-        fprintf(stderr, "usage: vh-dpid --mode shadow|enforce --stats <file> [--scan <file>]\n");
+        fprintf(stderr, "usage: vh-dpid --mode shadow|enforce --stats <file> [--scan <file>] [--flows <file>]\n");
         return 2;
     }
     signal(SIGTERM, on_signal);
@@ -314,12 +369,13 @@ int main(int argc, char **argv) {
 
     static char buf[65536];
     struct pollfd pfd = {.fd = mnl_socket_get_fd(log_sock), .events = POLLIN};
-    uint64_t next_stats = 0, next_sweep = now_ms() + SWEEP_EVERY_MS, lost = 0;
+    uint64_t next_stats = 0, next_sweep = now_ms() + SWEEP_EVERY_MS, next_flows = 0, lost = 0;
     rx r = {.engine = engine};
 
     while (!stop) {
         int ready = poll(&pfd, 1, 5000);
         r.now = now_ms();
+        verdict_now = r.now;
         if (ready > 0) {
             int n = (int) mnl_socket_recvfrom(log_sock, buf, sizeof buf);
             if (n < 0) {
@@ -333,6 +389,10 @@ int main(int argc, char **argv) {
             vh_engine_sweep(engine, r.now);
             write_scan(engine, r.now);
             next_sweep = r.now + SWEEP_EVERY_MS;
+        }
+        if (flows_path && flows_changed && r.now >= next_flows) {
+            write_flows(r.now);
+            next_flows = r.now + FLOWS_EVERY_MS;
         }
         if (r.now >= next_stats) {
             write_stats(stats_path, engine, lost);
