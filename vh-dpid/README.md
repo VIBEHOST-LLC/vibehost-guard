@@ -37,7 +37,10 @@ With `--flows <file>` it keeps the connections it judged BitTorrent in the last 
 `<tcp|udp> <src> <sport> <dst> <dport> <unix>`, mode 0600. It reads nothing else. `guard.sh vpn` (root) matches
 them to the access log of Xray or sing-box that the proxy holds open, or to the user's address inside a
 WireGuard/OpenVPN tunnel, and reports the VPN user's name to VibeHost: the server's owner disables that user
-instead of losing the server. When the owner asks, the user's addresses are dropped for 24 hours.
+instead of losing the server. When the owner asks, the user's addresses are dropped for 24 hours: only the
+ones connected to the core itself, never one two users came from (a bridge, HAProxy), nor one the log has
+but the core does not (PROXY protocol). The report says which way each user comes and how many addresses
+were really dropped.
 
 ## Build
 

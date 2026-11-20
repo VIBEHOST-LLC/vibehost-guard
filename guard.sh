@@ -2,7 +2,7 @@
 # Torrent guard. Usage: guard.sh <code> | apply | tick | scan | vpn
 set -u
 
-VERSION=9
+VERSION=10
 API="${VH_GUARD_API:-https://api.vibehost.net/api/v1/guard}"
 LIB=/usr/local/lib/vibehost-guard
 CONF_DIR=/etc/vibehost-guard
@@ -24,6 +24,7 @@ VPN_SEEN="$VPN_DIR/vpn.seen"
 VPN_OFFSETS="$VPN_DIR/vpn.offsets"
 VPN_CUT_IPS="$VPN_DIR/vpn.cutips"
 VPN_CUT="$CONF_DIR/vpn.cut"
+VPN_SHARED="$CONF_DIR/vpn.shared"
 DPI_BIT=0x100000
 DPI_PACKETS=12
 DPI_BYTES=512
@@ -298,10 +299,48 @@ function hostport(a) {
 function inport(tag) {
     return tag ~ /^inbound-[0-9]+$/ ? substr(tag, 9) + 0 : 0
 }
+function pad4(g) {
+    while (length(g) < 4) g = "0" g
+    return g
+}
+function expand6(a,   p, l, r, nl, nr, L, R, i, out) {
+    p = index(a, "::")
+    if (p) { l = substr(a, 1, p - 1); r = substr(a, p + 2) } else { l = a; r = "" }
+    nl = l == "" ? 0 : split(l, L, ":")
+    nr = r == "" ? 0 : split(r, R, ":")
+    out = ""
+    for (i = 1; i <= nl; i++) out = out (out == "" ? "" : ":") pad4(L[i])
+    for (i = 0; i < 8 - nl - nr; i++) out = out (out == "" ? "" : ":") "0000"
+    for (i = 1; i <= nr; i++) out = out (out == "" ? "" : ":") pad4(R[i])
+    return out
+}
+function norm(a) {
+    a = tolower(a)
+    if (a ~ /^::ffff:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return substr(a, 8)
+    return index(a, ":") ? expand6(a) : a
+}
+function v4(b1, b2, b3, b4) {
+    return hv[b1] "." hv[b2] "." hv[b3] "." hv[b4]
+}
+function procip(h,   i, w, out) {
+    h = tolower(substr(h, 1, index(h, ":") - 1))
+    if (length(h) == 8) return v4(substr(h, 7, 2), substr(h, 5, 2), substr(h, 3, 2), substr(h, 1, 2))
+    out = ""
+    for (i = 0; i < 4; i++) {
+        w = substr(h, i * 8 + 1, 8)
+        out = out (i ? ":" : "") substr(w, 7, 2) substr(w, 5, 2) ":" substr(w, 3, 2) substr(w, 1, 2)
+    }
+    if (substr(out, 1, 30) == "0000:0000:0000:0000:0000:ffff:")
+        return v4(substr(out, 31, 2), substr(out, 33, 2), substr(out, 36, 2), substr(out, 38, 2))
+    return out
+}
 function record(proto, name, tag, src,   k, n, i, ids) {
     if (name == "") return
     if (tag != "") tags[name] = tag
-    if (src != "" && (name in cut)) ips[name, src] = 1
+    if (src != "") {
+        src = norm(src)
+        if (!((name, src) in seenip)) { seenip[name, src] = 1; nip[src]++ }
+    }
     k = proto " " host " " port
     if (!(k in key)) return
     n = split(key[k], ids, " ")
@@ -314,6 +353,13 @@ function record(proto, name, tag, src,   k, n, i, ids) {
 }
 BEGIN {
     for (i = 1; i < 256; i++) { c = sprintf("%c", i); ord[c] = i; chr[sprintf("%02x", i)] = c }
+    for (i = 0; i < 256; i++) hv[sprintf("%02x", i)] = i
+    while ((getline l < sharedfile) > 0) {
+        if (split(l, f, " ") >= 2 && f[2] + 0 >= now - 604800) shared[f[1]] = f[2]
+    }
+    while ((getline l < peersfile) > 0) {
+        if (split(l, f, " ") >= 4 && f[4] == "01") peer[procip(f[3])] = 1
+    }
     while ((getline l < flows) > 0) {
         if (split(l, f, " ") < 6 || f[6] + 0 <= since + 0) continue
         id++
@@ -368,15 +414,31 @@ END {
         if ((id in owner) || !(id in fwd)) continue
         nm = fwd[id]; count[nm]++; kind[nm] = "fwd"
     }
-    for (nm in count) printf "%s %s %s %d\n", hex(nm), kind[nm], (nm in tags) ? hex(tags[nm]) : "-", count[nm] > found
+    for (s in nip) if (nip[s] >= 2) shared[s] = now
+    for (s in shared) print s, shared[s] > sharedout
+    for (k in seenip) {
+        split(k, q, SUBSEP)
+        has[q[1]] = 1
+        if (q[2] in shared) continue
+        open[q[1]] = 1
+        if (q[2] in peer) live[q[1]] = 1
+    }
+    for (nm in count) {
+        via = !(nm in has) || kind[nm] == "fwd" ? "-" : !(nm in open) ? "r" : peerok && !(nm in live) ? "p" : "-"
+        printf "%s %s %s %d %s\n", hex(nm), kind[nm], (nm in tags) ? hex(tags[nm]) : "-", count[nm], via > found
+    }
     for (nm in cut) {
         if (cutkind[nm] == "fwd") { line[nm " 0"] = cut[nm] " fwd " hex(nm); continue }
-        for (k in ips) {
+        for (k in seenip) {
             split(k, q, SUBSEP)
-            if (q[1] == nm) line[q[2] " " inport(tags[nm])] = cut[nm] " " cutkind[nm] " " hex(nm)
+            if (q[1] != nm || (q[2] in shared) || (peerok && !(q[2] in peer))) continue
+            line[q[2] " " inport(tags[nm])] = cut[nm] " " cutkind[nm] " " hex(nm)
         }
     }
-    for (k in line) print k, line[k] > cutout
+    for (k in line) {
+        split(k, q, " ")
+        if (!(q[1] in shared)) print k, line[k] > cutout
+    }
 }'
 
 vpn_logs() {
@@ -386,6 +448,17 @@ vpn_logs() {
             f=$(readlink "$fd" 2>/dev/null) || continue
             case "$k:$f" in xray:/*access*|sing:/*.log) echo "$k $fd" ;; esac
         done
+    done
+}
+
+vpn_peers() {
+    seen=
+    for d in /proc/[0-9]*; do
+        case "$(cat "$d/comm" 2>/dev/null)" in xray*|v2ray*|rw-core*|sing-box*) ;; *) continue ;; esac
+        ns=$(readlink "$d/ns/net" 2>/dev/null) || continue
+        case " $seen " in *" $ns "*) continue ;; esac
+        seen="$seen $ns"
+        cat "$d/net/tcp" "$d/net/tcp6" 2>/dev/null
     done
 }
 
@@ -426,10 +499,16 @@ vpn_run() {
     if [ "$fresh" -gt 0 ] || [ -s "$VPN_CUT" ]; then vpn_chunks read; else vpn_chunks skip; fi
     : > "$VPN_DIR/vpn.found"
     : > "$VPN_DIR/vpn.news"
+    : > "$VPN_SHARED.new"
+    vpn_peers > "$VPN_DIR/vpn.peers"
+    peerok=0
+    [ -s "$VPN_DIR/vpn.peers" ] && peerok=1
     LC_ALL=C awk -v flows="$DPI_FLOWS" -v since="$since" -v now="$now" -v cutfile="$VPN_CUT" \
         -v oldcut="$VPN_CUT_IPS" -v found="$VPN_DIR/vpn.found" -v cutout="$VPN_CUT_IPS.new" \
-        "$VPN_AWK" "$VPN_DIR/vpn.log"
-    rm -f "$VPN_DIR/vpn.log"
+        -v sharedfile="$VPN_SHARED" -v sharedout="$VPN_SHARED.new" -v peersfile="$VPN_DIR/vpn.peers" \
+        -v peerok="$peerok" "$VPN_AWK" "$VPN_DIR/vpn.log"
+    rm -f "$VPN_DIR/vpn.log" "$VPN_DIR/vpn.peers"
+    mv -f "$VPN_SHARED.new" "$VPN_SHARED"
     touch "$VPN_CUT_IPS.new"
     if ! cmp -s "$VPN_CUT_IPS.new" "$VPN_CUT_IPS"; then
         mv -f "$VPN_CUT_IPS.new" "$VPN_CUT_IPS"
@@ -443,7 +522,7 @@ vpn_run() {
         BEGIN { while ((getline l < old) > 0) { split(l, f, " "); u[f[1]] = l; n[f[1]] = f[4]; first[f[1]] = f[5]; last[f[1]] = f[6] } }
         {
             if (!($1 in u) || last[$1] < now - 86400) print $1 > news
-            u[$1] = $1 " " $2 " " $3 " " (n[$1] + $4) " " (($1 in first) ? first[$1] : now) " " now
+            u[$1] = $1 " " $2 " " $3 " " (n[$1] + $4) " " (($1 in first) ? first[$1] : now) " " now " " ($5 == "" ? "-" : $5)
         }
         END { for (h in u) { split(u[h], f, " "); if (f[6] >= now - 604800) print u[h] } }
     ' "$VPN_DIR/vpn.found" > "$VPN_USERS.new" && mv -f "$VPN_USERS.new" "$VPN_USERS"
@@ -517,9 +596,15 @@ vpn_report() {
     users=
     if [ -r "$VPN_USERS" ]; then
         users=$(sort -k6,6nr "$VPN_USERS" | awk -v now="$(date +%s)" \
-            '$6 >= now - 86400 && n < 32 { printf "%s%s:%s:%s:%s:%s:%s", (n++ ? ";" : ""), $1, $2, $3, $4, $5, $6 }')
+            '$6 >= now - 86400 && n < 32 { printf "%s%s:%s:%s:%s:%s:%s:%s", (n++ ? ";" : ""), $1, $2, $3, $4, $5, $6, ($7 == "" ? "-" : $7) }')
     fi
-    printf '"panels":"%s","log":"%s","users":"%s"' "$(vpn_panels)" "$log" "$users"
+    cut=
+    if [ -s "$VPN_CUT" ]; then
+        cut=$(awk -v now="$(date +%s)" -v ips="$VPN_CUT_IPS" '
+            BEGIN { while ((getline l < ips) > 0) { split(l, f, " "); if (f[3] + 0 > now) n[f[5]]++ } }
+            $3 + 0 > now && k < 64 { printf "%s%s:%d", (k++ ? ";" : ""), $1, n[$1] }' "$VPN_CUT")
+    fi
+    printf '"panels":"%s","log":"%s","users":"%s","cut":"%s"' "$(vpn_panels)" "$log" "$users" "$cut"
 }
 
 vpn_cut_save() {
