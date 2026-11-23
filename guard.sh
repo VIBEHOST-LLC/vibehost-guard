@@ -2,7 +2,7 @@
 # Torrent guard. Usage: guard.sh <code> | apply | tick | scan | vpn
 set -u
 
-VERSION=10
+VERSION=11
 API="${VH_GUARD_API:-https://api.vibehost.net/api/v1/guard}"
 LIB=/usr/local/lib/vibehost-guard
 CONF_DIR=/etc/vibehost-guard
@@ -806,6 +806,15 @@ os_name() {
     fi
 }
 
+cpu_report() {
+    m=$(awk -F': *' '/^model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null)
+    [ -n "$m" ] || m=$(lscpu 2>/dev/null | awk -F': *' '/^Model name/ { print $2; exit }')
+    m=$(printf '%s' "$m" | tr -cd 'A-Za-z0-9 ()@._,+/-' | cut -c1-96)
+    n=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    printf '"model":"%s","cores":%s' "$m" "$n"
+}
+
 post() {
     url=$1 body=$2 token=${3:-}
     if command -v curl >/dev/null 2>&1; then
@@ -936,7 +945,7 @@ tick() {
     ensure || ok=false
     [ -n "$VIBEHOST_GUARD_TOKEN" ] || return 0
     vpn_run </dev/null || true
-    body="{\"version\":$VERSION,\"rulesOk\":$ok,\"os\":\"$(os_name)\",\"counters\":{$(counters)},\"dpi\":{$(dpi_report)},\"scan\":{\"mode\":\"$(scan_mode)\",\"rules\":$(scan_rules)},\"vpn\":{$(vpn_report)}}"
+    body="{\"version\":$VERSION,\"rulesOk\":$ok,\"os\":\"$(os_name)\",\"counters\":{$(counters)},\"dpi\":{$(dpi_report)},\"scan\":{\"mode\":\"$(scan_mode)\",\"rules\":$(scan_rules)},\"vpn\":{$(vpn_report)},\"cpu\":{$(cpu_report)}}"
     answer=$(post "$API/heartbeat" "$body" "$VIBEHOST_GUARD_TOKEN") || return 0
     wanted=$(echo "$answer" | json_field dpi)
     case "$wanted" in off|shadow|enforce)
